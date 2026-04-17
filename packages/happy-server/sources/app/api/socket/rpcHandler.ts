@@ -2,6 +2,7 @@ import { log } from "@/utils/log";
 import { Server, Socket } from "socket.io";
 import type { RemoteSocket } from "socket.io";
 import type { DefaultEventsMap } from "socket.io/dist/typed-events";
+import { Counter, Histogram, register } from 'prom-client';
 
 // RPC routing uses Socket.IO rooms. A daemon registering method M for user U
 // joins room `rpc:U:M`. Callers look the daemon up cross-replica via
@@ -15,21 +16,67 @@ import type { DefaultEventsMap } from "socket.io/dist/typed-events";
 const RPC_ROOM_PREFIX = 'rpc:';
 const RPC_CALL_TIMEOUT_MS = 30_000;
 const RPC_PRESENCE_POLL_MS = 1_000;
-// Timeout for presence-poll fetchSockets. Must be << RPC_CALL_TIMEOUT_MS so a
-// dead replica that never replies to FETCH_SOCKETS doesn't itself stall the
-// poll for the cluster-adapter default of 5s.
+// Timeout for cross-replica fetchSockets during initial daemon lookup and the
+// reconnect grace window. Must be long enough for the full Redis streams
+// round-trip (XADD → peer XREAD → process → XADD response → local XREAD)
+// across all replicas. The cluster-adapter default heartbeatTimeout is 10s;
+// 2s is well above typical healthy latency (~50-200ms) while still allowing
+// ~6-7 polls within the grace window.
+const RPC_LOOKUP_FETCH_TIMEOUT_MS = 2_000;
+// Timeout for in-flight presence-poll fetchSockets. Must be << RPC_CALL_TIMEOUT_MS
+// so a dead replica doesn't stall each poll for the full adapter heartbeatTimeout
+// (10s). 500ms keeps daemon-death detection responsive (~1s).
 const RPC_PRESENCE_FETCH_TIMEOUT_MS = 500;
 // How long an rpc-call waits for the daemon socket to appear in the room when
-// the room is empty at call time (e.g. brief daemon reconnect window). Set to
-// 10s — 2× the streams adapter's 5s heartbeat interval — so cross-replica
-// room discovery has time to converge after a pod restart. Lower values cause
-// transient "method not available" failures for ~5s after every rolling
-// deploy when the daemon's reconnect lands on a freshly-started replica.
-const RPC_RECONNECT_GRACE_MS = 10_000;
+// the room is empty at call time (e.g. brief daemon reconnect window). With
+// RPC_LOOKUP_FETCH_TIMEOUT_MS at 2s + RPC_RECONNECT_POLL_MS at 200ms, each
+// poll iteration takes ~2.2s. 15s gives ~6-7 iterations — enough to catch a
+// daemon mid-reconnect after a rolling deploy or transient network drop.
+const RPC_RECONNECT_GRACE_MS = 15_000;
 const RPC_RECONNECT_POLL_MS = 200;
+
+const rpcCallCounter = new Counter({
+    name: 'rpc_calls_total',
+    help: 'Total RPC calls by method and outcome',
+    labelNames: ['method', 'result'] as const,
+    registers: [register]
+});
+
+const rpcCallDuration = new Histogram({
+    name: 'rpc_call_duration_seconds',
+    help: 'RPC call duration from receipt to response',
+    labelNames: ['method', 'result'] as const,
+    buckets: [0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 15, 30],
+    registers: [register]
+});
+
+const rpcLookupRetries = new Histogram({
+    name: 'rpc_lookup_retries',
+    help: 'Number of grace-window polls before finding daemon (0 = instant)',
+    labelNames: ['method'] as const,
+    buckets: [0, 1, 2, 3, 4, 5, 6, 7],
+    registers: [register]
+});
+
+const rpcFetchSocketsTimeouts = new Counter({
+    name: 'rpc_fetchsockets_timeouts_total',
+    help: 'Cross-replica fetchSockets timeouts by context',
+    labelNames: ['context'] as const,
+    registers: [register]
+});
 
 function rpcRoom(userId: string, method: string): string {
     return `${RPC_ROOM_PREFIX}${userId}:${method}`;
+}
+
+/**
+ * Strip the scope prefix (machineId/sessionId) from a prefixed method name
+ * to get the base method for metrics labels. Wire format: "cm9xyz123:bash" -> "bash".
+ * Falls back to "unknown" if no colon separator found.
+ */
+function baseMethodName(prefixedMethod: string): string {
+    const lastColon = prefixedMethod.lastIndexOf(':');
+    return lastColon >= 0 ? prefixedMethod.substring(lastColon + 1) : prefixedMethod;
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -37,18 +84,20 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 type RoomSockets = RemoteSocket<DefaultEventsMap, any>[];
 
 /**
- * fetchSockets(room) wrapped with our short cross-replica timeout. Returns
- * `[]` and logs on failure (cluster-adapter request timeout, peer replica
- * unresponsive). Cluster-adapter default timeout is 5s; we cap at 500ms so a
- * single dead peer doesn't stall the caller for the entire grace window.
+ * fetchSockets(room) wrapped with a caller-specified timeout. Returns `[]`
+ * and logs on failure (cluster-adapter request timeout, peer replica
+ * unresponsive). Use RPC_LOOKUP_FETCH_TIMEOUT_MS for daemon lookups (initial
+ * + grace window) and RPC_PRESENCE_FETCH_TIMEOUT_MS for in-flight presence
+ * polling.
  */
-async function fetchRoomSockets(io: Server, room: string): Promise<RoomSockets> {
+async function fetchRoomSockets(io: Server, room: string, timeoutMs: number, context: 'lookup' | 'presence' = 'lookup'): Promise<RoomSockets> {
     try {
         return await io.in(room)
-            .timeout(RPC_PRESENCE_FETCH_TIMEOUT_MS)
+            .timeout(timeoutMs)
             .fetchSockets();
     } catch (error) {
-        log({ module: 'websocket' }, `fetchSockets failed for ${room}: ${error}`);
+        rpcFetchSocketsTimeouts.inc({ context });
+        log({ module: 'websocket' }, `fetchSockets failed for ${room} (timeout=${timeoutMs}ms): ${error}`);
         return [];
     }
 }
@@ -58,12 +107,20 @@ async function fetchRoomSockets(io: Server, room: string): Promise<RoomSockets> 
  * elapses. Used to give a daemon a brief window to reconnect when an
  * rpc-call arrives during a transient disconnect.
  */
-async function waitForRoomMember(io: Server, room: string, maxMs: number): Promise<RoomSockets> {
+async function waitForRoomMember(io: Server, room: string, maxMs: number, metricMethod: string): Promise<RoomSockets> {
     const deadline = Date.now() + maxMs;
+    let polls = 0;
     while (true) {
-        const sockets = await fetchRoomSockets(io, room);
-        if (sockets.length > 0) return sockets;
-        if (Date.now() >= deadline) return sockets;
+        const sockets = await fetchRoomSockets(io, room, RPC_LOOKUP_FETCH_TIMEOUT_MS);
+        if (sockets.length > 0) {
+            rpcLookupRetries.observe({ method: metricMethod }, polls);
+            return sockets;
+        }
+        if (Date.now() >= deadline) {
+            rpcLookupRetries.observe({ method: metricMethod }, polls);
+            return sockets;
+        }
+        polls++;
         await sleep(RPC_RECONNECT_POLL_MS);
     }
 }
@@ -101,9 +158,19 @@ export function rpcHandler(userId: string, socket: Socket, io: Server) {
     });
 
     socket.on('rpc-call', async (data: any, callback: (response: any) => void) => {
+        const startTime = Date.now();
+        const { method, params } = data ?? {};
+
+        const finish = (result: string) => {
+            const durationSec = (Date.now() - startTime) / 1000;
+            const m = baseMethodName(method || 'unknown');
+            rpcCallCounter.inc({ method: m, result });
+            rpcCallDuration.observe({ method: m, result }, durationSec);
+        };
+
         try {
-            const { method, params } = data ?? {};
             if (!method || typeof method !== 'string') {
+                finish('invalid_params');
                 callback?.({ ok: false, error: 'Invalid parameters: method is required' });
                 return;
             }
@@ -113,12 +180,13 @@ export function rpcHandler(userId: string, socket: Socket, io: Server) {
             // unresponsive — fetchRoomSockets logs and returns []) fall
             // through to the wait-for-reconnect grace window.
             const room = rpcRoom(userId, method);
-            let targets = await fetchRoomSockets(io, room);
+            let targets = await fetchRoomSockets(io, room, RPC_LOOKUP_FETCH_TIMEOUT_MS);
             if (targets.length === 0) {
-                targets = await waitForRoomMember(io, room, RPC_RECONNECT_GRACE_MS);
+                targets = await waitForRoomMember(io, room, RPC_RECONNECT_GRACE_MS, baseMethodName(method));
             }
 
             if (targets.length === 0) {
+                finish('not_available');
                 callback?.({ ok: false, error: 'RPC method not available' });
                 return;
             }
@@ -129,6 +197,7 @@ export function rpcHandler(userId: string, socket: Socket, io: Server) {
 
             const target = targets[0];
             if (target.id === socket.id) {
+                finish('self_call');
                 callback?.({ ok: false, error: 'Cannot call RPC on the same socket' });
                 return;
             }
@@ -152,7 +221,7 @@ export function rpcHandler(userId: string, socket: Socket, io: Server) {
                 while (presenceAlive) {
                     await sleep(RPC_PRESENCE_POLL_MS);
                     if (!presenceAlive) return;
-                    const stillThere = await fetchRoomSockets(io, room);
+                    const stillThere = await fetchRoomSockets(io, room, RPC_PRESENCE_FETCH_TIMEOUT_MS, 'presence');
                     if (!stillThere.some(s => s.id === target.id)) {
                         throw new Error('RPC target disconnected');
                     }
@@ -161,14 +230,17 @@ export function rpcHandler(userId: string, socket: Socket, io: Server) {
 
             try {
                 const response = await Promise.race([ackPromise, presencePoll]);
+                finish('success');
                 callback?.({ ok: true, result: response });
             } catch (error) {
                 const errorMsg = error instanceof Error ? error.message : 'RPC call failed';
+                finish(errorMsg === 'RPC target disconnected' ? 'target_disconnected' : 'timeout');
                 callback?.({ ok: false, error: errorMsg });
             } finally {
                 presenceAlive = false;
             }
         } catch (error) {
+            finish('internal_error');
             log({ module: 'websocket', level: 'error' }, `Error in rpc-call: ${error}`);
             callback?.({ ok: false, error: 'Internal error' });
         }
